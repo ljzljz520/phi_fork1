@@ -13,6 +13,17 @@
 // that missed, show the file region it nearly matches, and hand back a
 // copy-ready payload to resend.
 //
+// # Commit stage
+//
+// Path spellings are normalized to absolute targets, so aliases (a.ts,
+// ./a.ts, dir/../a.ts, an absolute path) fold into one planned file. Anchor
+// validation is purely in-memory; the commit then re-checks every target for
+// external edits, stages the new bytes beside each file, and swaps them with
+// same-directory renames journaled under the OS temp dir. A failed swap rolls
+// the whole group back, an external edit is preserved and reported as a
+// conflict, and a process killed mid-swap is reconciled before the next edit
+// runs, so a success response means every target of the group is on disk.
+//
 // # Deviations from the reference engine
 //
 //   - A "*** SM:PUT" replaces the whole FIND match even when the pattern

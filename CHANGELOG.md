@@ -22,6 +22,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Multi-file `edit` payloads now commit through a journaled staging area
+  instead of overwriting files one by one: a write or rename failure rolls
+  every already-swapped file back, path aliases (`a.ts`, `./a.ts`,
+  `dir/../a.ts`, absolute) fold into one target, and files changed on disk
+  after the anchored read are preserved and reported as conflicts instead of
+  being overwritten. An interrupted commit is rolled back before the next
+  edit runs, so success is returned only once the whole group is on disk.
+
 ### Security
 
 <!-- Released section -->

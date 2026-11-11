@@ -3,7 +3,6 @@ package edittool
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 
@@ -161,11 +160,18 @@ func editDetail(in editInput) string {
 type fileRead struct {
 	path    string // absolute
 	display string
+	raw     []byte // exact disk bytes; the journal's rollback backup
 	text    string // LF-normalized
 	crlf    bool
 }
 
 func runEdit(ctx context.Context, in editInput) (tooldef.Result, error) {
+	return runEditWith(ctx, in, commitHooks{})
+}
+
+// runEditWith is runEdit with injectable commit faults, used by the commit
+// tests to force write failures and simulated process termination.
+func runEditWith(ctx context.Context, in editInput, hooks commitHooks) (tooldef.Result, error) {
 	payload := in.text()
 	if strings.TrimSpace(payload) == "" {
 		return tooldef.Result{}, errors.New(
@@ -181,44 +187,88 @@ func runEdit(ctx context.Context, in editInput) (tooldef.Result, error) {
 		}
 	}
 
-	files := make(map[string]fileRead, len(sections))
-	read := func(path string) (string, error) {
-		file, err := readFile(ctx, path)
-		if err != nil {
-			return "", err
-		}
-		files[path] = file
-		return file.text, nil
+	cwd, err := tooldef.Cwd(ctx)
+	if err != nil {
+		return tooldef.Result{}, err
 	}
-	results, err := applySections(sections, read)
+	committer := newCommitter(cwd, hooks)
+	// Finish an interrupted commit before anything else reads or writes.
+	if err := committer.reconcile(); err != nil {
+		return tooldef.Result{}, err
+	}
+
+	// Fold path aliases onto absolute targets so one file is read, planned,
+	// and committed exactly once.
+	merged, displays, err := normalizeSections(ctx, sections)
 	if err != nil {
 		return tooldef.Result{}, err
 	}
 
-	var body strings.Builder
-	displays := make([]string, 0, len(sections))
-	for _, section := range sections {
+	files := make(map[string]fileRead, len(merged))
+	results := make(map[string]Result, len(merged))
+	for _, section := range merged {
+		file, err := readFile(ctx, section.Path)
+		if err != nil {
+			return tooldef.Result{}, sectionError(displays[section.Path], err, len(merged))
+		}
+		files[section.Path] = file
+		// Diagnostics and copy-ready retry payloads keep the model-facing
+		// display path; the absolute spelling stays the internal key.
+		anchored := section
+		anchored.Path = displays[section.Path]
+		result, err := Apply(file.text, anchored, len(merged) == 1 && len(section.Ops) == 1)
+		if err != nil {
+			return tooldef.Result{}, sectionError(displays[section.Path], err, len(merged))
+		}
+		results[section.Path] = result
+	}
+
+	// Everything below is the staged commit: anchor failures above returned
+	// before any file was created or renamed.
+	targets := make([]fileTarget, 0, len(merged))
+	for _, section := range merged {
 		file := files[section.Path]
 		result := results[section.Path]
-		displays = append(displays, file.display)
-
-		if result.Content != file.text {
-			text := result.Content
-			if file.crlf {
-				text = strings.ReplaceAll(text, "\n", "\r\n")
-			}
-			//nolint:gosec // G306: source files should stay world-readable
-			if err := os.WriteFile(file.path, []byte(text), 0o644); err != nil {
-				return tooldef.Result{}, fmt.Errorf("failed to write file %s: %w", file.display, err)
-			}
+		if result.Content == file.text {
+			continue
 		}
+		text := result.Content
+		if file.crlf {
+			text = strings.ReplaceAll(text, "\n", "\r\n")
+		}
+		targets = append(targets, fileTarget{
+			abs:     file.path,
+			display: displays[file.path],
+			raw:     file.raw,
+			next:    []byte(text),
+			result:  result,
+		})
+	}
+
+	// Pre-flight external-edit check, then the journaled swap group. The
+	// success response is built only after commit reports the whole group on
+	// disk.
+	if err := verify(targets); err != nil {
+		return tooldef.Result{}, err
+	}
+	if err := committer.commit(targets); err != nil {
+		return tooldef.Result{}, err
+	}
+
+	var body strings.Builder
+	names := make([]string, 0, len(merged))
+	for _, section := range merged {
+		file := files[section.Path]
+		result := results[section.Path]
+		display := displays[section.Path]
+		names = append(names, display)
 
 		if body.Len() > 0 {
 			body.WriteString("\n")
 		}
-		body.WriteString(file.display)
+		body.WriteString(display)
 		body.WriteString("\n")
-		body.WriteString(util.GenerateFileDiff(file.display, file.text, result.Content, 3))
+		body.WriteString(util.GenerateFileDiff(display, file.text, result.Content, 3))
 		for _, note := range result.Notes {
 			body.WriteString(note)
 			body.WriteString("\n")
@@ -228,7 +278,7 @@ func runEdit(ctx context.Context, in editInput) (tooldef.Result, error) {
 	output := strings.TrimRight(body.String(), "\n")
 	return tooldef.Result{
 		Content: output,
-		Detail:  strings.Join(displays, ", "),
+		Detail:  strings.Join(names, ", "),
 		Output:  output,
 	}, nil
 }
@@ -247,6 +297,7 @@ func readFile(ctx context.Context, path string) (fileRead, error) {
 	return fileRead{
 		path:    absolute,
 		display: tooldef.RelToCwd(ctx, absolute),
+		raw:     raw,
 		text:    text,
 		crlf:    strings.Contains(string(raw), "\r\n"),
 	}, nil
